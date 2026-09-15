@@ -872,6 +872,10 @@ async fn check_sibling_via_profile(
 /// price of doubled viewer latency; this constant is the knob.
 const OBSERVER_PUBLISH_TICK: Duration = Duration::from_secs(1);
 
+/// Final telemetry is best-effort: allow paced publication before closing the
+/// relay, but never let a large backlog or blocked publisher hold shutdown open.
+const OBSERVER_SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+
 /// Byte budget for EVERYTHING retained while awaiting a publish slot: the
 /// event FIFO (serialized, post-`fit_observer_event_to_budget` bytes) PLUS
 /// the chunk coalescer's pending buffer (serialized event skeletons + raw
@@ -998,6 +1002,29 @@ impl ObserverPublishQueue {
     /// coalescer's pending chunk buffer.
     fn is_empty(&self) -> bool {
         self.events.is_empty() && self.coalescer.pending.is_empty()
+    }
+
+    /// Give the failure that actually exits the runtime the next normal publish
+    /// slot. Historical failures on an ordinary shutdown must not leapfrog a
+    /// newer successful retry. Its full
+    /// conversation context is self-contained; waiting behind other channels
+    /// could otherwise consume the entire bounded shutdown grace. This is a
+    /// shutdown-only exception to FIFO order, not an extra publish opportunity.
+    /// Earlier same-channel state may be ignored by live state consumers after
+    /// the terminal watermark advances; other channels retain their own marks.
+    /// Clients gate older turn state by sequence so late starts cannot revive
+    /// the failed turn; the transcript can still rebuild the remaining history.
+    fn next_shutdown_frame(&mut self) -> Option<observer::ObserverEvent> {
+        if let Some(index) = self.events.iter().rposition(|(_, _, event)| {
+            matches!(event.kind.as_str(), "turn_error" | "agent_panic")
+                && event.payload["runtimeExiting"] == true
+        }) {
+            if let Some((bytes, _, event)) = self.events.remove(index) {
+                self.pending_bytes -= bytes;
+                return Some(event);
+            }
+        }
+        self.next_frame()
     }
 
     /// Pack and remove AT MOST ONE publishable frame: the front event's
@@ -1151,6 +1178,7 @@ async fn run_relay_observer_publisher(
     );
     publish_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut closed = false;
+    let mut shutdown_priority_pending = true;
     loop {
         tokio::select! {
             result = rx.recv(), if !closed => {
@@ -1176,7 +1204,13 @@ async fn run_relay_observer_publisher(
                 }
             }
             _ = publish_tick.tick() => {
-                if let Some(frame) = queue.next_frame() {
+                let frame = if closed && shutdown_priority_pending {
+                    shutdown_priority_pending = false;
+                    queue.next_shutdown_frame()
+                } else {
+                    queue.next_frame()
+                };
+                if let Some(frame) = frame {
                     publish_relay_observer_event(
                         &publisher, &keys, &agent_pubkey_hex,
                         &owner_pubkey_hex, &owner_pubkey, frame,
@@ -1188,6 +1222,33 @@ async fn run_relay_observer_publisher(
             }
         }
     }
+}
+
+/// The run loop's final shutdown boundary: finish the observer while its relay
+/// transport is still available, then shut down that transport. Closing the bus
+/// explicitly is necessary because context and publisher tasks retain clones.
+async fn shutdown_relay_after_observer(
+    observer: Option<&observer::ObserverHandle>,
+    publisher_task: Option<tokio::task::JoinHandle<()>>,
+    relay_shutdown: impl std::future::Future<Output = ()>,
+) {
+    if let Some(observer) = observer {
+        observer.close();
+    }
+    if let Some(mut task) = publisher_task {
+        match tokio::time::timeout(OBSERVER_SHUTDOWN_GRACE, &mut task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("observer publisher stopped with error: {error}"),
+            Err(_) => {
+                tracing::warn!(
+                    "observer shutdown grace expired; remaining telemetry is best-effort"
+                );
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+    relay_shutdown.await;
 }
 
 #[derive(Default)]
@@ -4129,13 +4190,14 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    if let Some(handle) = relay_observer_publisher_task.take() {
-        handle.abort();
-    }
-
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
     // for the background task to finish, rather than aborting immediately (#40).
-    relay.shutdown().await;
+    shutdown_relay_after_observer(
+        observer.as_ref(),
+        relay_observer_publisher_task.take(),
+        relay.shutdown(),
+    )
+    .await;
 
     tracing::info!("buzz-acp stopped");
     Ok(())
@@ -4884,12 +4946,14 @@ fn handle_prompt_result(
     let emit_turn_error = |error_msg: &str,
                            error_code: Option<i64>,
                            respawn_scheduled: Option<bool>,
-                           reported_disposition: &str| {
+                           reported_disposition: &str,
+                           runtime_exiting: bool| {
         if let Some(ref observer) = observer {
             let mut payload = serde_json::json!({
                 "outcome": outcome_label,
                 "error": error_msg,
                 "disposition": reported_disposition,
+                "runtimeExiting": runtime_exiting,
                 "triggeringEventIds": triggering.event_ids,
                 "triggeringRootEventId": triggering.root_event_id,
                 "triggeringParentEventId": triggering.parent_event_id,
@@ -4966,6 +5030,7 @@ fn handle_prompt_result(
                 } else {
                     disposition
                 },
+                exiting,
             );
             if exiting {
                 tracing::error!("all agents dead — exiting");
@@ -5018,6 +5083,7 @@ fn handle_prompt_result(
                 } else {
                     disposition
                 },
+                exiting,
             );
             if exiting {
                 tracing::error!("all agents dead — exiting");
@@ -5057,7 +5123,7 @@ fn handle_prompt_result(
                 reason,
                 "agent_returned (local project context indeterminate — pipe intact)"
             );
-            emit_turn_error(&reason, None, None, disposition);
+            emit_turn_error(&reason, None, None, disposition, false);
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
@@ -5102,6 +5168,7 @@ fn handle_prompt_result(
                     } else {
                         disposition
                     },
+                    exiting,
                 );
                 if exiting {
                     tracing::error!("all agents dead — exiting");
@@ -5116,7 +5183,7 @@ fn handle_prompt_result(
                     error = %e,
                     "agent_returned (application error — pipe intact)"
                 );
-                emit_turn_error(&e.to_string(), error_code, None, disposition);
+                emit_turn_error(&e.to_string(), error_code, None, disposition, false);
                 pool.return_agent(result.agent);
             }
         }
@@ -5221,11 +5288,9 @@ fn recover_panicked_agent(
         }
     };
 
-    if disposition == "retrying"
-        && delay.is_none()
-        && pool.live_count() == 0
-        && !any_respawn_in_flight(crash_history)
-    {
+    let exiting =
+        delay.is_none() && pool.live_count() == 0 && !any_respawn_in_flight(crash_history);
+    if disposition == "retrying" && exiting {
         // The caller exits in this state; queued memory will not survive.
         disposition = "stopped";
     }
@@ -5246,6 +5311,7 @@ fn recover_panicked_agent(
                 "outcome": "panic",
                 "error": format!("Agent task panicked: {join_error}"),
                 "disposition": disposition,
+                "runtimeExiting": exiting,
                 "attempt": attempt,
                 "respawnScheduled": delay.is_some(),
                 "triggeringEventIds": triggering.event_ids,
@@ -8895,6 +8961,9 @@ mod observer_publish_queue_tests {
 }
 
 #[cfg(test)]
+mod observer_shutdown_tests;
+
+#[cfg(test)]
 mod observer_publish_cadence_tests {
     use super::*;
     use nostr::Keys;
@@ -9469,7 +9538,7 @@ mod error_outcome_emission_tests {
     use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
-    fn test_config() -> Config {
+    pub(super) fn test_config() -> Config {
         Config {
             keys: nostr::Keys::generate(),
             relay_url: "ws://localhost:3000".into(),
@@ -9541,7 +9610,7 @@ mod error_outcome_emission_tests {
     /// Spawn a real but inert agent subprocess (`cat`) so the error paths have
     /// an `OwnedAgent` to move into respawn or return to the pool. The error
     /// branches never talk to the subprocess.
-    async fn dummy_agent(index: usize) -> OwnedAgent {
+    pub(super) async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
             acp: AcpClient::spawn("cat", &[], &[], false)
@@ -10104,6 +10173,11 @@ mod error_outcome_emission_tests {
                     assert_eq!(respawn_tasks.len(), usize::from(scheduled), "{case}");
                     assert_eq!(crash_history[0].respawn_in_flight, scheduled, "{case}");
                     assert_eq!(action == LoopAction::Exit, exiting, "{case}");
+                    assert_eq!(
+                        failure.payload["runtimeExiting"],
+                        action == LoopAction::Exit,
+                        "{case}"
+                    );
                     assert_eq!(failure.turn_id.as_deref(), Some("fatal-turn"), "{case}");
                     assert_eq!(failure.payload["triggeringRootEventId"], root, "{case}");
                     assert_eq!(failure.payload["triggeringParentEventId"], parent, "{case}");
@@ -10242,6 +10316,10 @@ mod error_outcome_emission_tests {
             assert_eq!(panic.payload["triggeringRootEventId"], root);
             assert_eq!(panic.payload["triggeringParentEventId"], parent);
             assert_eq!(panic.payload["respawnScheduled"], !circuit_open);
+            assert_eq!(
+                panic.payload["runtimeExiting"],
+                circuit_open && capacity == "none"
+            );
             assert_eq!(respawn_tasks.len(), usize::from(!circuit_open));
             assert_eq!(
                 queue.queued_event_count(scope.clone()),
@@ -10360,6 +10438,10 @@ mod error_outcome_emission_tests {
         );
         assert_eq!(failure.turn_id.as_deref(), Some("cancel-turn"));
         assert_eq!(failure.payload["respawnScheduled"], !circuit_open);
+        assert_eq!(
+            failure.payload["runtimeExiting"],
+            action == LoopAction::Exit
+        );
         assert_eq!(respawn_tasks.len(), usize::from(!circuit_open));
         assert_eq!(
             failure.payload["error"]

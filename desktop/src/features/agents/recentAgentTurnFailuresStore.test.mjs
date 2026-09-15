@@ -209,6 +209,7 @@ describe("recentAgentTurnFailuresStore", () => {
 
 describe("retry batch coverage through observer listener", () => {
   beforeEach(resetRecentAgentTurnFailuresStore);
+
   it("clears A when retrying [A,B] anchored at B, preserving partial and unrelated failures", () => {
     const listener = createRecentAgentTurnFailuresObserverListener([
       { pubkey: AGENT, status: "running" },
@@ -290,5 +291,43 @@ describe("retry batch coverage through observer listener", () => {
     assert.equal(failure.disposition, "retrying");
     assert.equal(failure.respawnScheduled, false);
     assert.equal(failure.attempt, 2);
+  });
+
+  it("keeps a shutdown-promoted terminal when older telemetry arrives later", () => {
+    const listener = createRecentAgentTurnFailuresObserverListener([
+      { pubkey: AGENT, status: "running" },
+    ]);
+    const terminal = event({
+      seq: 20,
+      kind: "turn_error",
+      payload: {
+        error: "final worker exited",
+        disposition: "stopped",
+        respawnScheduled: false,
+        runtimeExiting: true,
+        triggeringEventIds: [TRIGGER],
+        triggeringRootEventId: ROOT,
+        triggeringParentEventId: TRIGGER,
+      },
+    });
+    listener({ agentPubkey: AGENT, events: [terminal] });
+    listener({
+      agentPubkey: AGENT,
+      events: [
+        event({ seq: 10 }),
+        {
+          ...terminal,
+          seq: 11,
+          payload: { ...terminal.payload, disposition: "retrying" },
+        },
+        event({ seq: 12, kind: "turn_completed" }),
+        { ...terminal, seq: 1, channelId: "other-channel" },
+      ],
+    });
+    const [failure] = getRecentAgentTurnFailures("channel-1", ROOT);
+    assert.equal(failure.disposition, "stopped");
+    assert.equal(failure.respawnScheduled, false);
+    assert.equal(failure.error, "final worker exited");
+    assert.equal(getRecentAgentTurnFailures("other-channel", ROOT).length, 1);
   });
 });
