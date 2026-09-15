@@ -5493,6 +5493,10 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 }
 
 #[cfg(test)]
+#[path = "pool_steer_retry_tests.rs"]
+mod steer_retry_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};

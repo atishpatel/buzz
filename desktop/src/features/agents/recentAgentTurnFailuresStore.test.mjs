@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, it } from "node:test";
 
 import {
@@ -209,6 +210,82 @@ describe("recentAgentTurnFailuresStore", () => {
 
 describe("retry batch coverage through observer listener", () => {
   beforeEach(resetRecentAgentTurnFailuresStore);
+
+  it("tracks the Rust-emitted full Steer retry lifecycle through exhaustion", () => {
+    // The production run_prompt_task -> handle_prompt_result regression in
+    // buzz-acp compares its emitted correlation and outcomes to this SAME
+    // fixture. Only transport envelope fields are supplied here.
+    const lifecycle = JSON.parse(
+      readFileSync(
+        new URL(
+          "../../../../crates/buzz-acp/tests/fixtures/steer-retry-observer.json",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    );
+    const listener = createRecentAgentTurnFailuresObserverListener([
+      { pubkey: AGENT, status: "running" },
+    ]);
+    listener({
+      agentPubkey: AGENT,
+      events: [
+        event({
+          kind: "turn_error",
+          turnId: "unrelated-turn",
+          payload: {
+            error: "unrelated failure",
+            disposition: "stopped",
+            triggeringEventIds: ["unrelated-request"],
+            triggeringRootEventId: "unrelated-root",
+          },
+        }),
+      ],
+    });
+
+    assert.deepEqual(
+      lifecycle.map(({ kind }) => kind),
+      [
+        "turn_started",
+        "turn_error",
+        "turn_started",
+        "turn_error",
+        "turn_started",
+        "turn_error",
+      ],
+    );
+    for (const [index, emitted] of lifecycle.entries()) {
+      listener({
+        agentPubkey: AGENT,
+        events: [event({ ...emitted, seq: index + 2 })],
+      });
+      const failures = getRecentAgentTurnFailures("channel-1", "thread-root");
+      if (emitted.kind === "turn_started") {
+        assert.equal(
+          failures.length,
+          0,
+          `full retry ${index} clears its prior failure`,
+        );
+      } else {
+        assert.equal(failures.length, 1);
+        assert.deepEqual(failures[0].triggeringEventIds, [
+          "request-a",
+          "request-b",
+        ]);
+        assert.equal(failures[0].parentEventId, "thread-parent");
+        assert.equal(failures[0].turnId, emitted.turnId);
+        assert.equal(failures[0].disposition, emitted.payload.disposition);
+        assert.equal(failures[0].attempt, emitted.payload.attempt);
+      }
+      assert.equal(
+        getRecentAgentTurnFailures("channel-1", "unrelated-root").length,
+        1,
+      );
+    }
+    const [terminal] = getRecentAgentTurnFailures("channel-1", "thread-root");
+    assert.equal(terminal.disposition, "dead_lettered");
+    assert.equal(terminal.attempt, 11);
+  });
 
   it("clears A when retrying [A,B] anchored at B, preserving partial and unrelated failures", () => {
     const listener = createRecentAgentTurnFailuresObserverListener([
