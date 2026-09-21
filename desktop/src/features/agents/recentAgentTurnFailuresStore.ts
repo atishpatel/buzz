@@ -39,7 +39,12 @@ export type RecentAgentTurnFailure = TurnContext & {
   timestamp: string;
 };
 
-const failuresByAgent = new Map<string, Map<string, RecentAgentTurnFailure>>();
+type StoredTurnFailure = {
+  failure: RecentAgentTurnFailure;
+  event: ObserverEvent;
+};
+
+const failuresByAgent = new Map<string, Map<string, StoredTurnFailure>>();
 const turnContextsByAgent = new Map<string, Map<string, TurnContext>>();
 const lastProcessedByAgent = new Map<string, Map<string, ObserverEvent>>();
 const listeners = new Set<() => void>();
@@ -126,13 +131,15 @@ function rememberTurnContext(
 function removeCoveredFailures(
   agentKey: string,
   context: TurnContext,
+  startedEvent: ObserverEvent,
 ): boolean {
   const failures = failuresByAgent.get(agentKey);
   if (!failures) return false;
   const coveredIds = new Set(context.triggeringEventIds);
   let changed = false;
-  for (const [key, failure] of failures) {
+  for (const [key, { failure, event }] of failures) {
     if (failure.channelId !== context.channelId) continue;
+    if (compareObserverEvents(startedEvent, event) <= 0) continue;
     const covered =
       failure.triggeringEventIds.length > 0
         ? failure.triggeringEventIds.every((id) => coveredIds.has(id))
@@ -147,7 +154,11 @@ function removeCoveredFailures(
   return changed;
 }
 
-function setFailure(agentKey: string, failure: RecentAgentTurnFailure) {
+function setFailure(
+  agentKey: string,
+  failure: RecentAgentTurnFailure,
+  event: ObserverEvent,
+) {
   let failures = failuresByAgent.get(agentKey);
   if (!failures) {
     failures = new Map();
@@ -155,7 +166,7 @@ function setFailure(agentKey: string, failure: RecentAgentTurnFailure) {
   }
   const key = failureKey(failure);
   failures.delete(key);
-  failures.set(key, failure);
+  failures.set(key, { failure, event });
   while (failures.size > MAX_FAILURES_PER_AGENT) {
     const oldest = failures.keys().next().value;
     if (oldest === undefined) break;
@@ -168,7 +179,16 @@ function processEvent(agentPubkey: string, event: ObserverEvent): boolean {
   const channelKey = event.channelId ?? "\u0000null-channel";
   let watermarks = lastProcessedByAgent.get(agentKey);
   const prior = watermarks?.get(channelKey);
-  if (prior && compareObserverEvents(event, prior) <= 0) return false;
+  if (prior && compareObserverEvents(event, prior) <= 0) {
+    // Shutdown can publish a terminal ahead of another turn's queued retry.
+    // Its late start may clear covered older failures, but must not regress
+    // the channel watermark, hydrate stale context, or clear a newer failure.
+    const context =
+      event.kind === "turn_started" && event.turnId
+        ? contextFromEvent(event)
+        : null;
+    return context ? removeCoveredFailures(agentKey, context, event) : false;
+  }
   if (!watermarks) {
     watermarks = new Map();
     lastProcessedByAgent.set(agentKey, watermarks);
@@ -180,7 +200,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent): boolean {
     const context = contextFromEvent(event);
     if (!context) return false;
     rememberTurnContext(agentKey, turnId, context);
-    return removeCoveredFailures(agentKey, context);
+    return removeCoveredFailures(agentKey, context, event);
   }
 
   if (event.kind !== "turn_error" && event.kind !== "agent_panic") {
@@ -209,22 +229,26 @@ function processEvent(agentPubkey: string, event: ObserverEvent): boolean {
   if (!context || !turnId) return false;
   const rawError = asString(payload.error) ?? "Unknown error";
   const numericAttempt = Number(payload.attempt);
-  setFailure(agentKey, {
-    ...context,
-    agentPubkey,
-    turnId,
-    error: friendlyTurnErrorCopy(rawError, payload.code),
-    disposition: disposition(payload.disposition),
-    respawnScheduled:
-      typeof payload.respawnScheduled === "boolean"
-        ? payload.respawnScheduled
-        : undefined,
-    attempt:
-      Number.isInteger(numericAttempt) && numericAttempt > 0
-        ? numericAttempt
-        : null,
-    timestamp: event.timestamp,
-  });
+  setFailure(
+    agentKey,
+    {
+      ...context,
+      agentPubkey,
+      turnId,
+      error: friendlyTurnErrorCopy(rawError, payload.code),
+      disposition: disposition(payload.disposition),
+      respawnScheduled:
+        typeof payload.respawnScheduled === "boolean"
+          ? payload.respawnScheduled
+          : undefined,
+      attempt:
+        Number.isInteger(numericAttempt) && numericAttempt > 0
+          ? numericAttempt
+          : null,
+      timestamp: event.timestamp,
+    },
+    event,
+  );
   return true;
 }
 
@@ -275,7 +299,7 @@ export function getRecentAgentTurnFailures(
 
   const failures: RecentAgentTurnFailure[] = [];
   for (const agentFailures of failuresByAgent.values()) {
-    for (const failure of agentFailures.values()) {
+    for (const { failure } of agentFailures.values()) {
       if (
         failure.channelId === channelId &&
         (rootEventId === null

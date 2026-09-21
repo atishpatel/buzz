@@ -6,8 +6,15 @@ import {
   createRecentAgentTurnFailuresObserverListener,
   getRecentAgentTurnFailures,
   resetRecentAgentTurnFailuresStore,
+  subscribeRecentAgentTurnFailures,
   syncRecentAgentTurnFailuresFromEvents,
+  syncRecentAgentTurnFailuresFromObserver,
 } from "./recentAgentTurnFailuresStore.ts";
+import {
+  resetAgentObserverStore,
+  subscribeAgentObserverStore,
+  syncAgentObserverEvents,
+} from "./observerRelayStore.ts";
 
 const AGENT = "a".repeat(64);
 const TRIGGER = "1".repeat(64);
@@ -406,5 +413,218 @@ describe("retry batch coverage through observer listener", () => {
     assert.equal(failure.respawnScheduled, false);
     assert.equal(failure.error, "final worker exited");
     assert.equal(getRecentAgentTurnFailures("other-channel", ROOT).length, 1);
+  });
+});
+
+describe("late recovery after shutdown terminal promotion", () => {
+  beforeEach(() => {
+    resetAgentObserverStore();
+    resetRecentAgentTurnFailuresStore();
+  });
+
+  const agents = [{ pubkey: AGENT, status: "running" }];
+  const context = (ids, root = ids.at(-1)) => ({
+    triggeringEventIds: ids,
+    triggeringRootEventId: root,
+  });
+
+  for (const timing of ["equal timestamp", "timestamp before sequence"]) {
+    for (const order of ["FIFO", "terminal promoted"]) {
+      it(`clears recovered A and keeps stopped B: ${order}, ${timing}`, () => {
+        const frames = [
+          event({
+            kind: "turn_error",
+            payload: {
+              ...context(["A"]),
+              error: "A failed",
+              disposition: "retrying",
+            },
+          }),
+          event({ turnId: "retry-A", payload: context(["A"]) }),
+          event({ kind: "turn_completed", turnId: "retry-A", payload: {} }),
+          event({ turnId: "turn-B", payload: context(["B"]) }),
+          event({
+            kind: "turn_error",
+            turnId: "turn-B",
+            payload: {
+              ...context(["B"]),
+              error: "B stopped",
+              disposition: "stopped",
+              runtimeExiting: true,
+              respawnScheduled: false,
+            },
+          }),
+        ].map((frame, index) => ({
+          ...frame,
+          // The second mode also covers a seq reset after A's failure.
+          seq:
+            timing === "equal timestamp"
+              ? index + 1
+              : index === 0
+                ? 100
+                : index,
+          timestamp:
+            timing === "equal timestamp"
+              ? "2026-09-09T17:49:05Z"
+              : `2026-09-09T17:49:0${index}Z`,
+        }));
+        let unsubscribe = subscribeAgentObserverStore(
+          createRecentAgentTurnFailuresObserverListener(agents),
+        );
+        const deliver = (frame) => syncAgentObserverEvents(AGENT, [frame]);
+        const assertRecovered = () => {
+          assert.equal(
+            getRecentAgentTurnFailures("channel-1", "A").length,
+            0,
+            "A recovered",
+          );
+          const [failure] = getRecentAgentTurnFailures("channel-1", "B");
+          assert.equal(failure?.error, "B stopped");
+          assert.equal(failure?.disposition, "stopped");
+          assert.equal(failure?.respawnScheduled, false);
+          assert.equal(getRecentAgentTurnFailures("channel-1").length, 1);
+        };
+        try {
+          for (const index of order === "FIFO"
+            ? [0, 1, 2, 3, 4]
+            : [0, 4, 1, 2, 3]) {
+            deliver(frames[index]);
+          }
+          assertRecovered();
+
+          let notifications = 0;
+          const unsubscribeFailures = subscribeRecentAgentTurnFailures(
+            () => notifications++,
+          );
+          try {
+            // Transport duplicates, a replayed buffer, and the actual bridge's
+            // snapshot hydration on remount must not revive A or clear B.
+            frames.forEach(deliver);
+            syncRecentAgentTurnFailuresFromEvents(AGENT, frames);
+            unsubscribe();
+            syncRecentAgentTurnFailuresFromObserver(agents);
+            unsubscribe = subscribeAgentObserverStore(
+              createRecentAgentTurnFailuresObserverListener(agents),
+            );
+            frames.forEach(deliver);
+            assertRecovered();
+            assert.equal(
+              notifications,
+              0,
+              "duplicate/replay/remount is idempotent",
+            );
+          } finally {
+            unsubscribeFailures();
+          }
+        } finally {
+          unsubscribe();
+        }
+      });
+    }
+  }
+
+  it("late retry clears only fully covered, strictly older failures", () => {
+    const listener = createRecentAgentTurnFailuresObserverListener(agents);
+    const failed = (seq, ids, root, extra = {}) =>
+      event({
+        seq,
+        kind: "turn_error",
+        turnId: `failure-${root}`,
+        payload: { ...context(ids, root), error: root, disposition: "stopped" },
+        ...extra,
+      });
+    listener({
+      agentPubkey: AGENT,
+      events: [
+        failed(1, ["A"], "old"),
+        failed(2, ["A", "C"], "partial"),
+        failed(3, ["D"], "unrelated"),
+        failed(4, [], "legacy"),
+        failed(5, ["A"], "equal"),
+        failed(6, ["A"], "newer"),
+        failed(7, ["A"], "same-conversation"),
+        failed(8, [], "legacy-newer"),
+        failed(9, ["A"], "other-channel", { channelId: "channel-2" }),
+      ],
+    });
+    syncRecentAgentTurnFailuresFromEvents("b".repeat(64), [
+      failed(1, ["A"], "other-agent"),
+    ]);
+    listener({
+      agentPubkey: AGENT,
+      events: [
+        event({
+          seq: 5,
+          turnId: "late-retry",
+          payload: context(["A"], "same-conversation"),
+        }),
+      ],
+    });
+    assert.equal(getRecentAgentTurnFailures("channel-1", "old").length, 0);
+    for (const root of [
+      "partial",
+      "unrelated",
+      "legacy",
+      "equal",
+      "newer",
+      "same-conversation",
+      "legacy-newer",
+    ]) {
+      assert.equal(
+        getRecentAgentTurnFailures("channel-1", root).length,
+        1,
+        `${root} survives`,
+      );
+    }
+    for (const root of ["legacy", "legacy-newer"]) {
+      listener({
+        agentPubkey: AGENT,
+        events: [event({ seq: 5, payload: context([], root) })],
+      });
+    }
+    assert.equal(getRecentAgentTurnFailures("channel-1", "legacy").length, 0);
+    assert.equal(
+      getRecentAgentTurnFailures("channel-1", "legacy-newer").length,
+      1,
+    );
+    assert.equal(
+      getRecentAgentTurnFailures("channel-2", "other-channel").length,
+      1,
+    );
+    assert.equal(
+      getRecentAgentTurnFailures("channel-1", "other-agent").length,
+      1,
+    );
+  });
+
+  it("timestamp ordering protects a newer failure despite its lower sequence", () => {
+    const listener = createRecentAgentTurnFailuresObserverListener(agents);
+    const terminal = event({
+      seq: 1,
+      timestamp: "2026-09-09T17:50:00Z",
+      kind: "turn_error",
+      payload: {
+        ...context(["A"]),
+        error: "new runtime stopped",
+        disposition: "stopped",
+      },
+    });
+    listener({ agentPubkey: AGENT, events: [terminal] });
+    listener({
+      agentPubkey: AGENT,
+      events: [
+        event({ seq: 100, payload: context(["A"]) }),
+        {
+          ...terminal,
+          seq: 99,
+          timestamp: "2026-09-09T17:49:05Z",
+          payload: { ...terminal.payload, disposition: "retrying" },
+        },
+      ],
+    });
+    assert.equal(
+      getRecentAgentTurnFailures("channel-1", "A")[0]?.disposition,
+      "stopped",
+    );
   });
 });
