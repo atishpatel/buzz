@@ -9,6 +9,10 @@ import {
 import { friendlyTurnErrorCopy } from "@/features/agents/lib/friendlyAgentLastError";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import type { ObserverEvent } from "./ui/agentSessionTypes";
+import {
+  advanceObserverChannelProgress,
+  type ObserverChannelProgress,
+} from "./observerChannelProgress";
 
 const MAX_FAILURES_PER_AGENT = 20;
 const MAX_TURN_CONTEXTS_PER_AGENT = 3_000;
@@ -46,7 +50,10 @@ type StoredTurnFailure = {
 
 const failuresByAgent = new Map<string, Map<string, StoredTurnFailure>>();
 const turnContextsByAgent = new Map<string, Map<string, TurnContext>>();
-const lastProcessedByAgent = new Map<string, Map<string, ObserverEvent>>();
+const lastProcessedByAgent = new Map<
+  string,
+  Map<string, ObserverChannelProgress>
+>();
 const listeners = new Set<() => void>();
 const cachedByScope = new Map<string, RecentAgentTurnFailure[]>();
 
@@ -165,35 +172,43 @@ function setFailure(
     failuresByAgent.set(agentKey, failures);
   }
   const key = failureKey(failure);
+  const prior = failures.get(key);
+  if (prior && compareObserverEvents(event, prior.event) <= 0) return false;
   failures.delete(key);
   failures.set(key, { failure, event });
   while (failures.size > MAX_FAILURES_PER_AGENT) {
-    const oldest = failures.keys().next().value;
-    if (oldest === undefined) break;
-    failures.delete(oldest);
+    // Arrival order is not age when shutdown promotes its final failure.
+    // Draining older buffered failures must not evict that newest terminal.
+    let oldest: [string, StoredTurnFailure] | undefined;
+    for (const entry of failures) {
+      if (
+        !oldest ||
+        compareObserverEvents(entry[1].event, oldest[1].event) < 0
+      ) {
+        oldest = entry;
+      }
+    }
+    if (!oldest) break;
+    failures.delete(oldest[0]);
   }
+  return true;
 }
 
 function processEvent(agentPubkey: string, event: ObserverEvent): boolean {
   const agentKey = normalizePubkey(agentPubkey);
   const channelKey = event.channelId ?? "\u0000null-channel";
   let watermarks = lastProcessedByAgent.get(agentKey);
-  const prior = watermarks?.get(channelKey);
-  if (prior && compareObserverEvents(event, prior) <= 0) {
-    // Shutdown can publish a terminal ahead of another turn's queued retry.
-    // Its late start may clear covered older failures, but must not regress
-    // the channel watermark, hydrate stale context, or clear a newer failure.
-    const context =
-      event.kind === "turn_started" && event.turnId
-        ? contextFromEvent(event)
-        : null;
-    return context ? removeCoveredFailures(agentKey, context, event) : false;
-  }
+  const admission = advanceObserverChannelProgress(
+    watermarks?.get(channelKey),
+    event,
+  );
+  if (!admission) return false;
   if (!watermarks) {
     watermarks = new Map();
     lastProcessedByAgent.set(agentKey, watermarks);
   }
-  watermarks.set(channelKey, event);
+  watermarks.set(channelKey, admission.progress);
+  if (!admission.apply) return false;
 
   const turnId = event.turnId;
   if (event.kind === "turn_started" && turnId) {
@@ -229,7 +244,7 @@ function processEvent(agentPubkey: string, event: ObserverEvent): boolean {
   if (!context || !turnId) return false;
   const rawError = asString(payload.error) ?? "Unknown error";
   const numericAttempt = Number(payload.attempt);
-  setFailure(
+  return setFailure(
     agentKey,
     {
       ...context,
@@ -249,7 +264,6 @@ function processEvent(agentPubkey: string, event: ObserverEvent): boolean {
     },
     event,
   );
-  return true;
 }
 
 export function syncRecentAgentTurnFailuresFromEvents(

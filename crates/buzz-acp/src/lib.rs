@@ -1010,9 +1010,10 @@ impl ObserverPublishQueue {
     /// conversation context is self-contained; waiting behind other channels
     /// could otherwise consume the entire bounded shutdown grace. This is a
     /// shutdown-only exception to FIFO order, not an extra publish opportunity.
-    /// Clients must compare late retry starts against each covered failure:
-    /// they can clear older failures in this channel, but not the promoted
-    /// terminal. The transcript can still rebuild the remaining history.
+    /// Clients must track this promotion separately from ordinary channel
+    /// progress so buffered sibling starts and outcomes still take effect,
+    /// without reviving this terminal turn or replacing its newer failure.
+    /// The transcript can still rebuild the remaining history.
     fn next_shutdown_frame(&mut self) -> Option<observer::ObserverEvent> {
         if let Some(index) = self.events.iter().rposition(|(_, _, event)| {
             matches!(event.kind.as_str(), "turn_error" | "agent_panic")

@@ -540,10 +540,15 @@ describe("late recovery after shutdown terminal promotion", () => {
         failed(2, ["A", "C"], "partial"),
         failed(3, ["D"], "unrelated"),
         failed(4, [], "legacy"),
-        failed(5, ["A"], "equal"),
-        failed(6, ["A"], "newer"),
-        failed(7, ["A"], "same-conversation"),
-        failed(8, [], "legacy-newer"),
+        ...[
+          failed(5, ["A"], "equal"),
+          failed(6, ["A"], "newer"),
+          failed(7, ["A"], "same-conversation"),
+          failed(8, [], "legacy-newer"),
+        ].map((frame) => ({
+          ...frame,
+          payload: { ...frame.payload, runtimeExiting: true },
+        })),
         failed(9, ["A"], "other-channel", { channelId: "channel-2" }),
       ],
     });
@@ -576,12 +581,14 @@ describe("late recovery after shutdown terminal promotion", () => {
         `${root} survives`,
       );
     }
-    for (const root of ["legacy", "legacy-newer"]) {
-      listener({
-        agentPubkey: AGENT,
-        events: [event({ seq: 5, payload: context([], root) })],
-      });
-    }
+    listener({
+      agentPubkey: AGENT,
+      events: [event({ seq: 6, payload: context([], "legacy") })],
+    });
+    listener({
+      agentPubkey: AGENT,
+      events: [event({ seq: 7, payload: context([], "legacy-newer") })],
+    });
     assert.equal(getRecentAgentTurnFailures("channel-1", "legacy").length, 0);
     assert.equal(
       getRecentAgentTurnFailures("channel-1", "legacy-newer").length,
